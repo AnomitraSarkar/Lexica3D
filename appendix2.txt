@@ -1,0 +1,641 @@
+1. Importing packages
+import torch
+import tempfile
+import numpy as np
+import trimesh
+from threading import Thread
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+# Disable tokenizers multi-process warning
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import trimesh
+import collections
+from typing import Tuple, Dict, List, Optional
+import pathlib import Path
+from torch import nn, optim
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+
+2. Fine-tuning Shap-E
+
+class TinyEncoder(nn.Module):
+    def __init__(self, latent_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3*2048, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, latent_dim)
+        )
+    def forward(self, pts):  # pts: (B, N, 3)
+        B = pts.shape[0]
+        x = pts.view(B, -1)
+        return self.net(x)   # (B, latent_dim)
+
+class TinyDiffusion(nn.Module):
+    def __init__(self, latent_dim=256, vocab_size=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + 128, 512),
+            nn.ReLU(),
+            nn.Linear(512, latent_dim)
+        )
+    def forward(self, latents, text_emb):  # text_emb: (B,128)
+        x = torch.cat([latents, text_emb], dim=-1)
+        return self.net(x)
+
+# -----------------------
+# Training routine
+# -----------------------
+def train(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ds = MeshCaptionDataset(args.csv, args.root, n_points=args.n_points)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=2, collate_fn=lambda x: x)
+
+    # initialize models (either Shap-E modules or tiny placeholders)
+    if SHAP_E_AVAILABLE and args.use_shap_e:
+        # ADAPT: this is pseudocode; adapt to actual shap-e constructor signatures
+        encoder = shap_e_encoder_module.EncoderModel(...)   # fill constructor args
+        diffusion = shap_e_diffusion_module.DiffusionModel(...)  # fill constructor args
+    else:
+        encoder = TinyEncoder(latent_dim=args.latent_dim)
+        diffusion = TinyDiffusion(latent_dim=args.latent_dim)
+
+    encoder.to(device)
+    diffusion.to(device)
+
+    opt_enc = optim.Adam(encoder.parameters(), lr=args.lr)
+    opt_diff = optim.Adam(diffusion.parameters(), lr=args.lr)
+
+    writer = SummaryWriter(args.logdir)
+    global_step = 0
+
+    for epoch in range(args.epochs):
+        running_loss = 0.0
+        running_chamfer = 0.0
+        running_iou = 0.0
+        count = 0
+
+        for batch in tqdm(dl, desc=f"Epoch {epoch}"):
+            # batch is a list of samples (collate_fn returned list)
+            # Prepare tensors
+            batch_points = torch.stack([b['points'] for b in batch], dim=0).to(device)  # (B,N,3)
+            captions = [b['caption'] for b in batch]
+
+            B = batch_points.shape[0]
+
+            # (1) Encoder forward: map GT mesh/points -> latent (supervised encoder fine-tune)
+            encoder.train()
+            latent = encoder(batch_points)  # (B, latent_dim)
+            # self-reconstruction / regression target: simplify by using latent as target itself (placeholder)
+            # Real training: encoder target is implicit params computed by encoder pretraining or known ground truth.
+            # Loss placeholder:
+            enc_loss = latent.norm() * 0.0  # placeholder zero term unless you have a regression target
+
+            # (2) Obtain text embeddings for captions (embedding method depends on chosen text encoder)
+            # Here we make a simple learned embedding for demo. Replace with CLIP/your text-encoder.
+            # For demo, simple bag-of-characters hashing:
+            text_emb = []
+            for c in captions:
+                vec = np.zeros(128, dtype=np.float32)
+                for ch in c[:64]:
+                    vec[ord(ch) % 128] += 1.0
+                vec = vec / (np.linalg.norm(vec) + 1e-9)
+                text_emb.append(vec)
+            text_emb = torch.from_numpy(np.stack(text_emb)).to(device)
+
+            # (3) Diffusion forward/ML loss (simplified)
+            diffusion.train()
+            # For simplicity, treat latent as noisy input and train diffusion to predict latent (placeholder)
+            pred_latent = diffusion(latent, text_emb)
+            diff_loss = ((pred_latent - latent) ** 2).mean()
+
+            total_loss = enc_loss + diff_loss
+
+            # Backprop
+            opt_enc.zero_grad()
+            opt_diff.zero_grad()
+            total_loss.backward()
+            opt_enc.step()
+            opt_diff.step()
+
+            # Metrics: Chamfer & IoU computed by rendering predicted latent back to points.
+            # In real shap-e, you would decode latent -> implicit -> sample points or render mesh.
+            # Here we'll pretend the decoder returns points by a toy linear map.
+            # Replace with actual shap-e decoder call when available.
+            with torch.no_grad():
+                # toy decode: map latent -> pointcloud (B,N,3)
+                decoded_pts = (torch.randn(B, args.n_points, 3, device=device) * 0.05) + \
+                              latent.unsqueeze(1).detach().cpu().numpy().mean()  # nonsense placeholder
+
+                # Convert ground-truth pts
+                gt_pts = batch_points.cpu().numpy()
+
+                # compute Chamfer (on CPU tensors)
+                cd = chamfer_distance(torch.from_numpy(decoded_pts).float(), batch_points.cpu()).item()
+                # compute IoU sample-wise (slow but OK for small batch)
+                iou_vals = []
+                for i in range(B):
+                    pred_arr = decoded_pts[i].reshape(-1,3)
+                    gt_arr = gt_pts[i].reshape(-1,3)
+                    iou_vals.append(voxel_iou_from_pointclouds(pred_arr, gt_arr))
+                iou_mean = float(np.mean(iou_vals))
+
+            running_loss += total_loss.item() * B
+            running_chamfer += cd * B
+            running_iou += iou_mean * B
+            count += B
+            global_step += 1
+
+            if global_step % args.print_every == 0:
+                print(f"Step {global_step} loss={total_loss.item():.6f} chamfer={cd:.6f} iou={iou_mean:.4f}")
+
+        epoch_loss = running_loss / max(1, count)
+        epoch_chamfer = running_chamfer / max(1, count)
+        epoch_iou = running_iou / max(1, count)
+        print(f"Epoch {epoch} summary: loss={epoch_loss:.6f}, chamfer={epoch_chamfer:.6f}, iou={epoch_iou:.4f}")
+
+        writer.add_scalar('train/loss', epoch_loss, epoch)
+        writer.add_scalar('train/chamfer', epoch_chamfer, epoch)
+        writer.add_scalar('train/iou', epoch_iou, epoch)
+
+        # optional: save checkpoint
+        torch.save({
+            'epoch': epoch,
+            'encoder_state': encoder.state_dict(),
+            'diffusion_state': diffusion.state_dict(),
+            'opt_enc': opt_enc.state_dict(),
+            'opt_diff': opt_diff.state_dict()
+        }, os.path.join(args.ckpt_dir, f'checkpoint_epoch_{epoch}.pth'))
+
+    writer.close()
+
+3. Loading LLama Mesh model
+def load_model():
+    model_path = "Zhengyi/LLaMA-Mesh"
+    print(f"Loading model {model_path} on device auto...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="auto",
+        load_in_8bit=True,        #  Keeps VRAM usage low (colab-friendly)
+        low_cpu_mem_usage=True,
+    )
+    print("Model loaded successfully.")
+    return tokenizer, model
+
+4. Model Generation
+# common for both LlaMa-Mesh and Shap-E
+
+tokenizer, model = load_model()
+
+terminators = [
+    tokenizer.eos_token_id,
+    tokenizer.convert_tokens_to_ids("<|eot_id|>")
+]
+
+# Direct chat-based mesh generation
+def generate_mesh(prompt: str, max_new_tokens=4096, temperature=0.8):
+    conversation = [{"role": "user", "content": prompt}]
+    print("Conversation loaded")
+    input_ids = tokenizer.apply_chat_template(conversation, return_tensors="pt").to(model.device)
+    print("input ids")
+
+    streamer = TextIteratorStreamer(tokenizer, timeout=10.0, skip_prompt=True, skip_special_tokens=True)
+    print("Streamer")
+    generation_kwargs = dict(
+        input_ids=input_ids,
+        streamer=streamer,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        eos_token_id=terminators
+    )
+    print("generate")
+
+    # Run generation in background thread for streaming behavior
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    output_text = ""
+    for piece in streamer:
+        output_text += piece
+        print(piece, end="")
+
+    return output_text
+
+def save_obj(mesh_text: str, filename="output_mesh.obj"):
+    with open(filename, "w") as f:
+        f.write(mesh_text)
+    print(f"Mesh saved: {filename}")
+    return filename
+
+prompt = "Create a hexagonal simple screw obj format"
+print("Generating...")
+mesh_obj = generate_mesh(prompt)
+print(mesh_obj[:500], "...")  # Preview first 500 chars
+
+# Save the generated model
+save_obj(mesh_obj)
+
+4. Intermediate SRMS Generation
+
+import collections
+from typing import Tuple, Dict, List
+
+def is_watertight_trimesh(path: str) -> Tuple[bool, Dict]:
+    """
+    Uses trimesh if available. Returns (is_watertight, info).
+    info contains keys: 'watertight' (bool), 'euler' (optional), 'is_winding_consistent' etc.
+    """
+    try:
+        import trimesh
+    except Exception as e:
+        raise RuntimeError("trimesh not available. Install with: pip install trimesh") from e
+
+    mesh = trimesh.load(path, force='mesh')
+    # trimesh might return a Scene for some files, try to combine
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(mesh.dump())
+
+    info = {
+        "watertight": bool(mesh.is_watertight),
+        "is_winding_consistent": bool(mesh.is_winding_consistent),
+    }
+    # Euler characteristic sometimes available
+    try:
+        info["euler_number"] = float(mesh.euler_number)
+    except Exception:
+        pass
+    return bool(mesh.is_watertight), info
+
+
+def is_watertight_manual(path: str, return_boundary_examples: int = 10) -> Tuple[bool, Dict]:
+    verts_count = 0
+    faces = []
+
+    with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('v '):
+                verts_count += 1
+            elif line.startswith('f '):
+                parts = line.split()[1:]
+                # faces may use formats like "i", "i/j", or "i/j/k"
+                idxs = []
+                for p in parts:
+                    if '/' in p:
+                        idx = p.split('/')[0]
+                    else:
+                        idx = p
+                    try:
+                        idxs.append(int(idx) - 1)  # make zero-based
+                    except ValueError:
+                        # skip malformed indices
+                        pass
+                if len(idxs) >= 3:
+                    # triangulate n-gons into triangles (fan)
+                    for i in range(1, len(idxs) - 1):
+                        faces.append((idxs[0], idxs[i], idxs[i + 1]))
+
+    # Build undirected edges and count occurrences
+    edge_counts = collections.Counter()
+    for a, b, c in faces:
+        tri_edges = ((a, b), (b, c), (c, a))
+        for e in tri_edges:
+            # undirected canonical form
+            if e[0] <= e[1]:
+                edge = (e[0], e[1])
+            else:
+                edge = (e[1], e[0])
+            edge_counts[edge] += 1
+
+    boundary_edges = [e for e, cnt in edge_counts.items() if cnt == 1]
+    nonmanifold_edges = [e for e, cnt in edge_counts.items() if cnt > 2]
+
+    is_watertight = (len(boundary_edges) == 0) and (len(nonmanifold_edges) == 0)
+
+    info = {
+        "vertex_count": verts_count,
+        "face_count": len(faces),
+        "edge_count": len(edge_counts),
+        "boundary_edge_count": len(boundary_edges),
+        "nonmanifold_edge_count": len(nonmanifold_edges),
+        "boundary_examples": boundary_edges[:return_boundary_examples],
+        "nonmanifold_examples": nonmanifold_edges[:return_boundary_examples],
+    }
+    return is_watertight, info
+
+
+def is_watertight(path: str, prefer: str = "trimesh") -> Tuple[bool, Dict]:
+    """
+    Wrapper. prefer='trimesh' (default) tries trimesh first, falls back to manual.
+    prefer='manual' uses manual check only.
+    """
+    if prefer == "manual":
+        return is_watertight_manual(path)
+
+    # Try trimesh and fallback gracefully
+    try:
+        return is_watertight_trimesh(path)
+    except Exception:
+        return is_watertight_manual(path)
+
+if __name__ == "__main__":
+    path = "output_mesh.obj"
+
+    # prefer trimesh (recommended)
+    watertight, info = is_watertight(path, prefer="trimesh")
+    print("Watertight:", watertight)
+    print("Info:", info)
+
+    # or force manual check
+    watertight2, info2 = is_watertight(path, prefer="manual")
+    print("Manual check -> Watertight:", watertight2)
+    print("Manual info:", info2)
+
+
+5. Deletion and Re-iteration
+
+import os
+import math
+import collections
+from typing import Tuple, Dict, List, Optional
+
+def parse_obj_and_face_list(path: str):
+    verts = []
+    faces = []
+    with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('v '):
+                parts = line.split()
+                verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif line.startswith('f '):
+                parts = line.split()[1:]
+                idxs = []
+                for p in parts:
+                    if '/' in p:
+                        idx = p.split('/')[0]
+                    else:
+                        idx = p
+                    try:
+                        idxs.append(int(idx) - 1)
+                    except ValueError:
+                        pass
+                if len(idxs) >= 3:
+                    # triangulate n-gon using fan
+                    for i in range(1, len(idxs)-1):
+                        faces.append((idxs[0], idxs[i], idxs[i+1]))
+    return verts, faces
+
+def manual_watertight_check(path: str, return_examples: int = 10) -> Dict:
+    verts, faces = parse_obj_and_face_list(path)
+    edge_counts = collections.Counter()
+    for a, b, c in faces:
+        tri_edges = ((a,b),(b,c),(c,a))
+        for e in tri_edges:
+            edge = tuple(sorted(e))
+            edge_counts[edge] += 1
+    boundary_edges = [e for e,cnt in edge_counts.items() if cnt == 1]
+    nonmanifold_edges = [e for e,cnt in edge_counts.items() if cnt > 2]
+    info = {
+        "vertex_count": len(verts),
+        "face_count": len(faces),
+        "edge_count": len(edge_counts),
+        "boundary_edge_count": len(boundary_edges),
+        "nonmanifold_edge_count": len(nonmanifold_edges),
+        "boundary_examples": boundary_edges[:return_examples],
+        "nonmanifold_examples": nonmanifold_edges[:return_examples],
+    }
+    info["is_watertight"] = (info["boundary_edge_count"] == 0 and info["nonmanifold_edge_count"] == 0)
+    return info
+
+# --- Main kernel ---
+def optimize_obj_for_cad(
+    in_path: str,
+    out_path: str,
+    prefer_trimesh: bool = True,
+    repair_hole_size_threshold: Optional[float] = None,
+    run_poisson_if_needed: bool = True,
+    decimate_to_faces: Optional[int] = None,
+    verbose: bool = True
+) -> Dict:
+    report = {"in_path": in_path, "out_path": out_path}
+    # 0) basic existence
+    if not os.path.isfile(in_path):
+        raise FileNotFoundError(in_path)
+
+    # 1) initial checks
+    report["manual_check_before"] = manual_watertight_check(in_path)
+
+    # try trimesh load
+    try:
+        import trimesh
+        mesh = trimesh.load(in_path, force='mesh')
+        if isinstance(mesh, trimesh.Scene):
+            mesh = trimesh.util.concatenate(mesh.dump())
+        report["trimesh_present"] = True
+    except Exception as e:
+        mesh = None
+        report["trimesh_present"] = False
+        report["trimesh_error"] = str(e)
+
+    # If trimesh available, use some helper info:
+    if mesh is not None:
+        report["trimesh_before"] = {
+            "watertight": bool(mesh.is_watertight),
+            "is_winding_consistent": bool(getattr(mesh, "is_winding_consistent", None)),
+            "euler_number": float(getattr(mesh, "euler_number", math.nan)) if hasattr(mesh, "euler_number") else None,
+            "vertices": mesh.vertices.shape[0],
+            "faces": mesh.faces.shape[0]
+        }
+    else:
+        report["trimesh_before"] = None
+
+    # 2) Fast cleanup (degenerate faces, remove duplicate vertices)
+    repaired_mesh = None
+    if mesh is not None:
+        # remove degenerate faces
+        mesh.remove_degenerate_faces()
+        mesh.remove_duplicate_faces()
+        mesh.remove_unreferenced_vertices()
+        mesh.merge_vertices()  # weld based on default tolerance
+        mesh.fix_normals()     # orient consistent
+        repaired_mesh = mesh.copy()
+        report["fast_cleanup_done"] = True
+
+    # Re-check manual boundary state
+    temp_path_after_fast = in_path + ".fast_tmp.obj"
+    if repaired_mesh is not None:
+        repaired_mesh.export(temp_path_after_fast)
+        report["manual_check_after_fast"] = manual_watertight_check(temp_path_after_fast)
+    else:
+        report["manual_check_after_fast"] = report["manual_check_before"]
+
+    # 3) Try pymeshfix hole filling if available and boundary edges remain
+    tried_meshfix = False
+    if report["manual_check_after_fast"]["boundary_edge_count"] > 0:
+        try:
+            import pymeshfix
+            tried_meshfix = True
+            if repaired_mesh is None:
+                # load with trimesh alternative lazy parse
+                import trimesh
+                repaired_mesh = trimesh.load(in_path, force='mesh')
+            # convert to numpy arrays
+            import numpy as np
+            verts = repaired_mesh.vertices.copy()
+            faces = repaired_mesh.faces.copy()
+            mf = pymeshfix.MeshFix(verts, faces)
+            mf.repair(verbose=False)
+            verts_fixed, faces_fixed = mf.v, mf.f
+            # build new trimesh
+            import trimesh
+            mesh2 = trimesh.Trimesh(vertices=verts_fixed, faces=faces_fixed, process=True)
+            mesh2.remove_unreferenced_vertices()
+            mesh2.fix_normals()
+            repaired_mesh = mesh2
+            report["used_pymeshfix"] = True
+        except Exception as e:
+            report["used_pymeshfix"] = False
+            report["pymeshfix_error"] = str(e)
+
+    # save intermediate if changed
+    if repaired_mesh is not None:
+        intermediate_path = in_path + ".repaired_tmp.obj"
+        repaired_mesh.export(intermediate_path)
+        report["manual_check_after_repair"] = manual_watertight_check(intermediate_path)
+    else:
+        report["manual_check_after_repair"] = report["manual_check_after_fast"]
+
+    # 4) If still not watertight (or nonmanifold edges) and Poisson allowed, try Open3D Poisson reconstruction
+    final_mesh = repaired_mesh
+    if run_poisson_if_needed and report["manual_check_after_repair"]["is_watertight"] is False:
+        # only try if Open3D available
+        try:
+            import open3d as o3d
+            # convert repaired_mesh (trimesh) to Open3D
+            if final_mesh is None:
+                # load original into trimesh then convert
+                import trimesh
+                final_mesh = trimesh.load(in_path, force='mesh')
+            # sample points on surface and compute normals if necessary
+            pcd = o3d.geometry.PointCloud()
+            pts = final_mesh.sample(20000) if final_mesh.vertices.shape[0] > 0 else final_mesh.vertices
+            pcd.points = o3d.utility.Vector3dVector(pts)
+            # If no normals on point cloud, approximate from mesh normals
+            if not pcd.has_normals():
+                # ask final_mesh for vertex normals
+                try:
+                    final_mesh.compute_vertex_normals()
+                    vn = final_mesh.vertex_normals
+                    # sample per point from nearest vertex normals (approx)
+                    import numpy as np
+                    from scipy.spatial import cKDTree
+                    kdt = cKDTree(final_mesh.vertices)
+                    _, idxs = kdt.query(pts, k=1)
+                    normals = final_mesh.vertex_normals[idxs]
+                    pcd.normals = o3d.utility.Vector3dVector(normals)
+                except Exception:
+                    # fallback: estimate normals from point cloud
+                    pcd.estimate_normals()
+            # Poisson reconstruction
+            poisson_mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+            # crop by density to remove low-density spurious parts
+            densities = np.asarray(densities)
+            density_threshold = np.quantile(densities, 0.01)  # keep top 99%
+            vertices_to_keep = densities > density_threshold
+            # convert back into trimesh
+            verts_o3d = np.asarray(poisson_mesh.vertices)
+            faces_o3d = np.asarray(poisson_mesh.triangles)
+            import trimesh
+            tmesh = trimesh.Trimesh(vertices=verts_o3d, faces=faces_o3d, process=True)
+            tmesh.remove_unreferenced_vertices()
+            tmesh.fix_normals()
+            final_mesh = tmesh
+            report["used_poisson"] = True
+        except Exception as e:
+            report["used_poisson"] = False
+            report["poisson_error"] = str(e)
+
+    # 5) Final cleanup: remove tiny disconnected components, re-check
+    if final_mesh is not None:
+        try:
+            # remove tiny components (keep the largest connected component)
+            import numpy as np
+            comps = final_mesh.split(only_watertight=False)
+            if len(comps) > 1:
+                # pick the largest by face count
+                sizes = [c.faces.shape[0] for c in comps]
+                largest_idx = int(np.argmax(sizes))
+                final_mesh = comps[largest_idx]
+                report["did_component_prune"] = True
+            final_mesh.remove_degenerate_faces()
+            final_mesh.remove_duplicate_faces()
+            final_mesh.remove_unreferenced_vertices()
+            final_mesh.fix_normals()
+        except Exception as e:
+            report["final_cleanup_error"] = str(e)
+
+    # Optional decimation
+    if decimate_to_faces and final_mesh is not None:
+        try:
+            # trimesh has simplification via wrappers if installed; else skip
+            final_mesh = final_mesh.simplify_quadratic_decimation(decimate_to_faces)
+            report["did_decimation"] = True
+        except Exception as e:
+            report["did_decimation"] = False
+            report["decimation_error"] = str(e)
+
+    # Export result (if we have one) and final checks
+    if final_mesh is not None:
+        final_mesh.export(out_path)
+        report["manual_check_after_all"] = manual_watertight_check(out_path)
+        if report.get("trimesh_present", False):
+            try:
+                report["trimesh_after"] = {
+                    "watertight": bool(final_mesh.is_watertight),
+                    "is_winding_consistent": bool(getattr(final_mesh, "is_winding_consistent", None)),
+                    "euler_number": float(getattr(final_mesh, "euler_number", math.nan)) if hasattr(final_mesh, "euler_number") else None,
+                    "vertices": final_mesh.vertices.shape[0],
+                    "faces": final_mesh.faces.shape[0]
+                }
+            except Exception:
+                pass
+    else:
+        # no final mesh created; just copy original to out_path and return
+        import shutil
+        shutil.copyfile(in_path, out_path)
+        report["manual_check_after_all"] = report["manual_check_after_repair"]
+
+    if verbose:
+        print("Optimization report:")
+        for k, v in report.items():
+            if k.startswith("__"):
+                continue
+            print("-", k, ":", v if (isinstance(v, (str, bool, int)) or v is None) else type(v))
+
+    return report
+
+save_obj(mesh_obj, "output_mesh.obj")
+report = optimize_obj_for_cad("output_mesh.obj", "output_mesh_fixed.obj", run_poisson_if_needed=True)
+# examine report
+if not report["manual_check_after_all"]["is_watertight"]:
+    # decide what to do: accept, try automatic repair deeper, or regenerate with modified prompt
+    print("Repair did not produce watertight. Consider re-run or discard.")
+else:
+    print("Mesh is watertight and exported to file_fixed.obj")
+
+6. Visualize model 
+import trimesh
+
+mesh = trimesh.load("output_mesh_fixed.obj")
+mesh.show()
+
+All the code listed here can also be found in our GitHub repository: https://github.com/AnomitraSarkar/Lexica3D
